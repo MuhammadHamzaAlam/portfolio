@@ -1,0 +1,25 @@
+"""Adds Gemini retry + fallback models to the HRZ backend.
+Run from the backend folder:   .venv\\Scripts\\python patch_fallback.py
+Safe to run twice: already-applied changes are skipped. Backups are saved as *.bak
+"""
+import shutil
+from pathlib import Path
+
+EDITS = [('app/rag/chat.py', 'class GeminiGenerator:\n    def __init__(self, api_key: str, model: str):\n        from google import genai\n\n        self.client = genai.Client(api_key=api_key)\n        self.model = model\n\n    def generate(self, system: str, contents: list[dict]) -> str:\n        from google.genai import types\n\n        res = self.client.models.generate_content(\n            model=self.model,\n            contents=[types.Content(role=c["role"], parts=[types.Part(text=c["text"])]) for c in contents],\n            config=types.GenerateContentConfig(system_instruction=system, temperature=0.2, max_output_tokens=900),\n        )\n        return (res.text or "").strip()\n\n\n', 'RETRYABLE = {429, 500, 502, 503, 504}\n\n\nclass GeminiGenerator:\n    """Generates with the configured model; on overload (503/429/5xx) retries with backoff, then\n    tries the fallback models in order. A model that doesn\'t exist (404) is skipped immediately."""\n\n    def __init__(self, api_key: str, model: str, fallbacks: list[str] | None = None, client=None, sleep=None):\n        import time\n\n        if client is None:\n            from google import genai\n\n            client = genai.Client(api_key=api_key)\n        self.client = client\n        self.model = model\n        self.models = [model] + [m for m in (fallbacks or []) if m and m != model]\n        self.sleep = sleep or time.sleep\n        self.last_model_used: str | None = None\n\n    def generate(self, system: str, contents: list[dict]) -> str:\n        from google.genai import types\n\n        cfg = types.GenerateContentConfig(\n            system_instruction=system, temperature=0.2, max_output_tokens=900,\n            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),\n        )\n        payload = [types.Content(role=c["role"], parts=[types.Part(text=c["text"])]) for c in contents]\n        last_exc: Exception | None = None\n        for model in self.models:\n            for attempt in range(3):  # 1 try + 2 retries per model\n                try:\n                    res = self.client.models.generate_content(model=model, contents=payload, config=cfg)\n                    self.last_model_used = model\n                    return (res.text or "").strip()\n                except Exception as exc:  # google.genai.errors.APIError carries .code\n                    last_exc = exc\n                    code = getattr(exc, "code", None)\n                    if code in RETRYABLE and attempt < 2:\n                        self.sleep(1.5 * (attempt + 1))\n                        continue\n                    if code in RETRYABLE or code == 404:\n                        break  # move on to the next model\n                    raise  # auth / bad request: no point trying other models\n        raise last_exc if last_exc else RuntimeError("no Gemini model available")\n\n\n'), ('app/config.py', '    embedding_model: str = field(default_factory=lambda: _env("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"))', '    chat_fallbacks: list[str] = field(default_factory=lambda: [m.strip() for m in _env(\n        "GEMINI_CHAT_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3.6-flash").split(",") if m.strip()])\n    embedding_model: str = field(default_factory=lambda: _env("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"))'), ('app/main.py', 'self.generator = GeminiGenerator(s.gemini_api_key, s.chat_model)', 'self.generator = GeminiGenerator(s.gemini_api_key, s.chat_model, s.chat_fallbacks)'), ('app/main.py', 'if status == 429 else \\', 'if status in (429, 503) else \\'), ('app/main.py', '        return {"ok": True, "assistant": ASSISTANT_NAME, "answer": result.answer, "sources": result.sources}', '        used = getattr(rag.generator, "last_model_used", None)\n        if used and used != settings.chat_model:\n            log.info("chat: answered with fallback model %s", used)\n        return {"ok": True, "assistant": ASSISTANT_NAME, "answer": result.answer, "sources": result.sources}'), ('app/cli.py', 'GeminiGenerator(s.gemini_api_key, s.chat_model), top_k=s.top_k)', 'GeminiGenerator(s.gemini_api_key, s.chat_model, s.chat_fallbacks), top_k=s.top_k)')]
+
+changed = 0
+for path, old, new in EDITS:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if new in text:
+        print(f"already applied: {path}")
+        continue
+    if old not in text:
+        raise SystemExit(f"STOP: could not find the expected code in {path}. Nothing further was changed; send this message to Claude.")
+    bak = p.with_suffix(p.suffix + ".bak")
+    if not bak.exists():
+        shutil.copyfile(p, bak)
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    changed += 1
+    print(f"updated: {path}")
+print(f"Done ({changed} change(s)). Restart the server: .venv\\Scripts\\uvicorn app.main:app --port 8000")
